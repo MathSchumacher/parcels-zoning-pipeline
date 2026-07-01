@@ -11,6 +11,8 @@ import (
 	_ "modernc.org/sqlite"
 	"takehome/ingest"
 	"takehome/spatial"
+
+	"github.com/paulmach/orb"
 )
 
 type Store struct {
@@ -202,7 +204,7 @@ func (s *Store) RunTransform(ctx context.Context) error {
 
 		var districtID *string
 		for _, z := range zones {
-			if spatial.Contains(z.geom, centroid) {
+			if spatial.Contains(z.geom.(orb.Geometry), centroid) {
 				districtID = &z.district.ID
 				break
 			}
