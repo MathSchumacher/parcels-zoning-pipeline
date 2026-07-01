@@ -153,7 +153,7 @@ func (s *Store) RunTransform(ctx context.Context) error {
 		return err
 	}
 	
-	stmtZ, err := tx.Prepare(`INSERT INTO zoning_districts (id, zone_code, zone_name, is_residential, geom) VALUES (?, ?, ?, ?, ?)`)
+	stmtZ, err := tx.Prepare(`INSERT INTO zoning_districts (id, zone_code, zone_name, is_residential) VALUES (?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -171,12 +171,12 @@ func (s *Store) RunTransform(ctx context.Context) error {
 		}
 		
 		zones = append(zones, loadedZone{district: z, geom: g})
-		stmtZ.Exec(z.ID, z.Code, z.Name, z.IsRes, z.Geometry)
+		stmtZ.Exec(z.ID, z.Code, z.Name, z.IsRes)
 	}
 	stmtZ.Close()
 
 	// 3. Stream parcels and calculate metrics in Go
-	stmtP, err := tx.Prepare(`INSERT INTO parcels (id, computed_acres, district_id, geom) VALUES (?, ?, ?, ?)`)
+	stmtP, err := tx.Prepare(`INSERT INTO parcels (id, computed_acres, district_id) VALUES (?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -210,7 +210,7 @@ func (s *Store) RunTransform(ctx context.Context) error {
 			}
 		}
 
-		stmtP.Exec(pID, acres, districtID, pGeomStr)
+		stmtP.Exec(pID, acres, districtID)
 	}
 
 	return tx.Commit()
