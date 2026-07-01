@@ -25,7 +25,8 @@ func CalculateAcres(geom orb.Geometry) float64 {
 
 // GetCentroid returns the area-weighted centroid of the geometry (acts as PointOnSurface approximation)
 func GetCentroid(geom orb.Geometry) orb.Point {
-	return planar.CentroidArea(geom)
+	centroid, _ := planar.CentroidArea(geom)
+	return centroid
 }
 
 // Contains checks if a point is inside a Polygon or MultiPolygon
