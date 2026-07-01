@@ -1,38 +1,115 @@
-# Implementation Plan: Parcels & Zoning Data Product
+# Parcels & Zoning Data Product — Design Document
 
-*Revised based on senior architectural review.*
+A pipeline that ingests Hays County parcels and City of Buda zoning, normalizes both, and answers: **residential parcels larger than one acre, with lot size computed from geometry, rolled up into count and median lot size by area.**
 
-## Architecture & System Decomposition
+Time-boxed to 3–4 hours. This document states what I built, the calls I made, the calls I deliberately deferred, and the questions I'd take back to stakeholders.
 
-We are building a **CLI Data Pipeline**, cutting the UI entirely to focus the 3-4 hour budget on core data engineering, idempotency, and clean spatial processing.
+---
 
-1.  **Ingestion (Go):** Fetches from Hays County and Buda ArcGIS REST APIs.
-    *   *Sturdiness*: Loops with `resultOffset`/`resultRecordCount`, uses `orderByFields` on a stable ID to avoid pagination bugs, and implements retry-with-backoff.
-    *   *CRS & Format*: Requests `outSR=2277` (Texas Central Feet) and `f=geojson` (to avoid Esri ring-winding issues).
-2.  **Raw Store (PostgreSQL + PostGIS):** 
-    *   Tables `raw_parcels` and `raw_zoning` storing raw geometry and source attributes.
-    *   *Idempotency*: Uses `INSERT ... ON CONFLICT (source_id) DO UPDATE` to handle duplicates and allow clean re-runs.
-3.  **Transformation & Core Logic (PostGIS):**
-    *   **Area**: `ST_Area(geom) / 43560` (accurate and simple because CRS is in feet).
-    *   **Spatial Join**: Uses `ST_Intersects` with `ST_PointOnSurface(parcel.geom)` to avoid crescent/L-shape centroid misses. Uses GiST indexes for O(log N) performance, avoiding O(N*M) waste.
-    *   **Residential Rule**: Checks both code and name fields: `UPPER(TRIM(zone_code)) LIKE 'R%' OR UPPER(TRIM(zone_name)) LIKE 'R%'`.
-4.  **Normalized View / Stats**: A derived table/view that runs the final grouping query. The CLI simply prints this table to stdout.
+## 1. Data reconnaissance (what's wrong with the inputs)
 
-## Key Decisions & Deferrals
+A few minutes sizing up the feeds surfaced the issues that actually shaped the design:
 
-*   **Decision (PostGIS vs Pure Go)**: I am explicitly choosing not to reinvent computational geometry. Hand-rolling shoelace and ray-casting algorithms introduces subtle bugs (holes, multipart geometries). PostGIS handles CRS, `ST_Area`, and `ST_PointOnSurface` natively. *Trade-off*: Adds a Docker dependency, but buys massive defensibility and trivializes the "1km" stretch goal.
-*   **Decision (PointOnSurface vs Full Overlap)**: We use `ST_PointOnSurface` to assign a parcel to a zoning district. *Deferred*: Majority-area overlap (`ST_Intersection` + area ratio) is a more accurate but complex solution for parcels that straddle zoning boundaries.
-*   **Decision (CLI over UI)**: A CLI tool demonstrates scope discipline. We defer visual rendering to focus on data integrity.
+- **Two jurisdictions, mismatched coverage.** Zoning covers the *city* of Buda; parcels cover the *whole county*. The overwhelming majority of parcels have no zoning at all — so the spatial join must be built to *not match* as the common case, not the exception.
+- **Projection / units quirk.** Area must be computed, not read. Correct area depends entirely on the coordinate system. Hays County sits in the **NAD83 Texas Central** state-plane zone (`EPSG:2277`), whose unit is **US survey feet** — so I normalize both feeds into 2277 and compute area in ft².
+- **Serving format.** ArcGIS FeatureServers return Esri JSON (`rings`) by default, where holes and multipart polygons are implied by ring winding rather than structured. Requesting `f=geojson` sidesteps a class of ring-orientation bugs.
+- **Unreliable stated areas + likely duplicates/nulls.** The brief warns the stated lot areas are stale; the ingestion assumes duplicate parcel IDs and null/blank zoning codes exist and handles both rather than trusting the source to be clean.
 
-## Requirements Elicitation (Questions for Stakeholders)
+---
 
-The final deliverable will prominently feature these questions:
-1.  **What does "by area" mean?** Grouping residential parcels by "zoning category" is mildly circular. Does the business actually want stats grouped by a named subdivision, council district, or a spatial grid (e.g., H3)?
-2.  **The "R" Prefix False Positives:** The rule `starts with R` will catch "REC" (Recreation) or "ROW" (Right of Way). Should we maintain an explicit exclusion list?
-3.  **Unzoned Parcels:** Hays County parcels cover the whole county; Buda Zoning only covers the city. How should we bucket the tens of thousands of parcels that fall outside city limits?
+## 2. Architecture
 
-## Execution Steps (TDD)
-1.  **Setup**: `docker-compose.yml` for PostGIS. Init Go module.
-2.  **Test Ingestion**: Test pagination logic and retry mechanics against a mock HTTP server.
-3.  **Test Spatial Logic**: Execute SQL tests against PostGIS inserting a known 1-acre square and verifying `ST_Area`; insert overlapping/non-overlapping shapes to test `ST_PointOnSurface`.
-4.  **Build Pipeline**: Write the CLI command to trigger ingestion, run the `.sql` transformations, and print the results.
+A four-stage pipeline with a hard seam between *raw* and *derived* data, so a re-run — or a corrected source — never leaves a mess.
+
+```mermaid
+flowchart LR
+    A[ArcGIS REST APIs<br/>Hays Parcels · Buda Zoning] -->|paginated fetch<br/>outSR=2277, f=geojson| B[Ingestion<br/>Go]
+    B -->|upsert on source_id| C[(Raw Store<br/>raw_parcels · raw_zoning<br/>geometry + source attrs)]
+    C -->|stream raw geometry| D[Spatial Processor<br/>Go (orb/planar)]
+    D -->|insert transformed| E[(Derived Model<br/>zoning_districts · parcels<br/>+ assignment)]
+    E -->|count + median by area| F[Stats Query]
+    F --> G[CLI · stdout / JSON]
+
+    subgraph Transform logic
+        D1[planar.Area / 43560 → acres]
+        D2[PointOnSurface + Contains → district]
+        D3[R-prefix classifier on code OR name]
+    end
+```
+
+### System decomposition
+
+| Component | Responsibility |
+|---|---|
+| **Ingestion (Go)** | Paginated, resumable fetch from both ArcGIS services. Normalizes CRS and format at the boundary. Owns retries and backoff. |
+| **Raw Store (SQLite)** | `raw_parcels`, `raw_zoning` — geometry plus *all* source attributes, keyed by source ID. The immutable landing zone; upsert-only. |
+| **Transform (Pure Go + orb)** | Derives acres, classifies residential, assigns each parcel to a zoning district. Uses pure Go spatial math. |
+| **Stats / CLI (Go)** | Runs the grouping query and prints the result table (or JSON). No business logic lives here. |
+
+**Why Pure Go + SQLite.** I explicitly chose *not* to reinvent computational geometry, and also *not* to rely on Docker (PostGIS) or C-compilers (SpatiaLite). To ensure this runs on any machine identically, I used `github.com/paulmach/orb`, a pure Go library that natively handles polygon area computation and Point-in-Polygon raycasting correctly. The data is stored in `modernc.org/sqlite`, a pure Go SQLite port, meaning zero external dependencies are required.
+
+---
+
+## 3. Data model
+
+Two datasets modeled as two entities, joined by an assignment — not flattened into one table, so the relationship between parcel and zoning stays explicit and re-derivable.
+
+```sql
+-- Landing zone: raw, keyed by source, geometry + everything the source gave us.
+CREATE TABLE raw_parcels (
+    source_id TEXT PRIMARY KEY,
+    attrs TEXT,
+    geom TEXT
+);
+
+CREATE TABLE raw_zoning (
+    source_id TEXT PRIMARY KEY,
+    zone_code TEXT,
+    zone_name TEXT,
+    geom TEXT
+);
+
+-- Derived model: rebuilt from raw on every run.
+CREATE TABLE zoning_districts (
+    id TEXT PRIMARY KEY,
+    zone_code TEXT,
+    zone_name TEXT,
+    is_residential BOOLEAN
+);
+
+CREATE TABLE parcels (
+    id TEXT PRIMARY KEY,
+    computed_acres REAL,
+    district_id TEXT REFERENCES zoning_districts(id)
+);
+```
+
+Keeping raw geometry and source attributes means the derived layer can be recomputed with corrected logic *without re-fetching* — the whole point of a re-runnable pipeline.
+
+---
+
+## 4. Key decisions & deliberate deferrals
+
+| Decision | Rationale (one line) |
+|---|---|
+| Pure Go `orb` over PostGIS/SpatiaLite | Zero dependencies required; no Docker or C-compilers needed on Windows. |
+| CLI over UI | A UI is the least-core thing in the brief; the budget goes to data integrity. |
+| `PointOnSurface` for the join | Guaranteed-interior point; cheap accuracy win over centroid. |
+| Normalize both feeds to 2277 at ingest | Single source of truth for units; area math becomes trivial and correct. |
+| Group by zoning district (interim) | Directly joinable and defensible — but see the open question below. |
+
+**Consciously deferred** (named, not hidden):
+- **Majority-area overlap join** for parcels straddling a zoning boundary — more accurate, more complex; Point-in-Polygon is the defensible 4-hour call.
+- **The UI** — deferred entirely.
+- **The 1 km stretch** — deferred but *trivial* here: it would require a simple planar distance check inside our `spatial` Go loop.
+- **Geodesic area** — unnecessary inside a single state-plane zone.
+
+---
+
+## 5. Requirements — assumptions & questions
+
+**Questions I'd take back to stakeholders** (with why they matter):
+1. **What does "by area" mean?** Grouping residential parcels by zoning district is mildly circular (the groups are, by construction, residential districts). Do you want stats by a named **subdivision/neighborhood** field, a **council district**, or a spatial grid (e.g., H3)? *Changes the whole aggregation axis.*
+2. **R-prefix false positives.** The rule also matches `REC` (recreation) or `ROW` (right-of-way) if such codes exist. Do we want an explicit exclusion list, or is over-inclusion acceptable? *Directly moves the counts.*
+3. **Straddling parcels.** When a parcel spans two districts, is representative-point assignment acceptable, or do you need majority-area (or split) attribution? *Affects boundary parcels and the definition of "belongs to."*
+4. **Unzoned parcels.** Report them as an explicit "outside city / unzoned" bucket, or exclude silently? *Changes whether the output is city-only or county-wide.*

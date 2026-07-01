@@ -12,13 +12,13 @@ import (
 const (
 	parcelsURL = "https://services6.arcgis.com/vXZW4vAaPRr14z2s/arcgis/rest/services/Hays_County_Parcels/FeatureServer/0"
 	zoningURL  = "https://services6.arcgis.com/vXZW4vAaPRr14z2s/arcgis/rest/services/Zoning/FeatureServer/0"
-	connStr    = "postgres://postgres:postgres@localhost:5432/spatialdb?sslmode=disable"
+	connStr    = "file:spatialdb.sqlite?cache=shared"
 )
 
 func main() {
 	ctx := context.Background()
 
-	fmt.Println("Connecting to PostGIS...")
+	fmt.Println("Connecting to SQLite database...")
 	store, err := db.Connect(connStr)
 	if err != nil {
 		log.Fatalf("Failed to connect to db: %v", err)
@@ -49,7 +49,7 @@ func main() {
 		log.Fatalf("Failed to upsert parcels: %v", err)
 	}
 
-	fmt.Println("Running PostGIS Transformations...")
+	fmt.Println("Running Spatial Transformations in Go...")
 	if err := store.RunTransform(ctx); err != nil {
 		log.Fatalf("Failed to run transform: %v", err)
 	}
