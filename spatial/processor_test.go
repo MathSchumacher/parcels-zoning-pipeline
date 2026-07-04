@@ -2,6 +2,8 @@ package spatial
 
 import (
 	"testing"
+
+	"github.com/paulmach/orb/planar"
 )
 
 func TestCalculateAcres(t *testing.T) {
@@ -45,9 +47,35 @@ func TestSpatialJoin_LShape(t *testing.T) {
 	}`)
 	parcelGeom, _ := ParseGeometry(parcelJSON)
 
-	centroid := GetCentroid(parcelGeom)
-	if !Contains(zoneGeom, centroid) {
-		t.Errorf("Expected L-shaped parcel centroid to be contained in zone")
+	pt := PointOnSurface(parcelGeom)
+	if !Contains(parcelGeom, pt) {
+		t.Errorf("Expected point-on-surface to be inside the parcel itself")
+	}
+	if !Contains(zoneGeom, pt) {
+		t.Errorf("Expected L-shaped parcel's point-on-surface to be contained in zone")
+	}
+}
+
+// A U-shaped parcel whose centroid falls in the notch — outside the polygon.
+// This is the case where a bare centroid joins the parcel to the wrong
+// district (or none); PointOnSurface must fall back to an interior point.
+func TestPointOnSurface_UShape(t *testing.T) {
+	parcelJSON := []byte(`{
+		"type": "Polygon",
+		"coordinates": [[
+			[0, 0], [10, 0], [10, 10], [7, 10], [7, 3], [3, 3], [3, 10], [0, 10], [0, 0]
+		]]
+	}`)
+	parcelGeom, _ := ParseGeometry(parcelJSON)
+
+	centroid, _ := planar.CentroidArea(parcelGeom)
+	if Contains(parcelGeom, centroid) {
+		t.Fatalf("test setup: centroid unexpectedly inside the U; fallback not exercised")
+	}
+
+	pt := PointOnSurface(parcelGeom)
+	if !Contains(parcelGeom, pt) {
+		t.Errorf("Expected point-on-surface (%v) to be inside the U-shaped parcel", pt)
 	}
 }
 
@@ -58,9 +86,17 @@ func TestIsResidential(t *testing.T) {
 		expected bool
 	}{
 		{"R-1", "", true},
+		{"R1", "Estate Residential", true},
 		{"", "Residential - Single Family", true},
 		{" RM ", "", true},
 		{"C-1", "Commercial", false},
+		// Real Buda districts: names starting with "R" that are NOT
+		// residential under the brief's rule.
+		{"PD", "Reserve at Cole Springs", false},
+		// Ambiguity flagged in the design doc: residential in nature, but
+		// the brief's rule excludes it (code B2, name starts "Suburban").
+		{"B2", "Suburban Residential", false},
+		{"F1", "Rural", false},
 		{"", "", false},
 	}
 

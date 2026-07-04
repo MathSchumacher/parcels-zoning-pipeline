@@ -16,3 +16,8 @@ vendor/
 
 # Local data or environments
 .env
+
+# Local database artifacts
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
